@@ -154,7 +154,7 @@ else:
 
     # 2.3 DISPLAY
     if 'daily_nav' in locals() and not daily_nav.empty:
-        tab1, tab2, tab3 = st.tabs(["📈 Market Comparison", "🏢 NSE Sector Composition", "🔔 Insights & News"])
+        tab1, tab2, tab3 = st.tabs(["📈 Performance", "🏢 Portfolio", "🔔 Insights & News"])
 
         with tab1:
             st.subheader(f"Performance: {period_choice}")
