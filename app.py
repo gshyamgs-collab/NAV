@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 DB_FILE = "moonshot_portfolio.xlsx"
 BENCHMARKS = {
     "Nifty 50": "^NSEI",
-    "Nifty Midcap 150": "^NSEMDCP150"
+    "Nifty Midcap 100": "^NSEMDCP100"
 }
 
 st.set_page_config(page_title="Moonshot NAV Intelligence", layout="wide", page_icon="🚀")
@@ -17,7 +17,7 @@ st.set_page_config(page_title="Moonshot NAV Intelligence", layout="wide", page_i
 # --- DATABASE ENGINE ---
 def save_to_excel(init_df, trans_df, meta_df):
     m_copy = meta_df.copy()
-    t_copy = trans_db.copy() if trans_db is not None else trans_df.copy()
+    t_copy = trans_df.copy()
     if 'Date' in m_copy.columns: m_copy['Date'] = pd.to_datetime(m_copy['Date']).dt.date
     if 'Date' in t_copy.columns: t_copy['Date'] = pd.to_datetime(t_copy['Date']).dt.date
     with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
@@ -100,76 +100,86 @@ else:
         ticker_list = [t for t in holdings.keys() if t != "CASH"]
         all_prices = yf.download(ticker_list + list(BENCHMARKS.values()), start=abs_start, end=today, progress=False)['Close'].ffill()
 
-    tab1, tab2, tab3 = st.tabs(["📈 Performance", "🏢 Portfolio", "🔔 Insights & AI Summary"])
+    tab_main, tab_comp, tab_ins = st.tabs(["📈 Performance", "🏢 Portfolio", "🔔 Corporate Actions"])
 
-    with tab1:
-        duration = st.select_slider("Select Time Period", options=["1W", "1M", "6M", "1Yr", "3Yr", "5Yr", "Max"], value="Max")
-        deltas = {"1W": 7, "1M": 30, "6M": 182, "1Yr": 365, "3Yr": 1095, "5Yr": 1825}
-        start_f = abs_start if duration == "Max" else max(abs_start, today - timedelta(days=deltas[duration]))
+    with tab_main:
+        # --- TAB OVER CHART FOR PERIODS ---
+        st.write("### NAV vs Benchmarks")
+        period_tabs = st.tabs(["1W", "1M", "6M", "1Yr", "3Yr", "5Yr", "Max"])
+        deltas = {"1W": 7, "1M": 30, "6M": 182, "1Yr": 365, "3Yr": 1095, "5Yr": 1825, "Max": None}
         
-        filtered_prices = all_prices[all_prices.index.date >= start_f]
-        if not filtered_prices.empty:
-            port_ts = pd.Series(0.0, index=filtered_prices.index)
-            for t, q in holdings.items():
-                if t in filtered_prices.columns: port_ts += filtered_prices[t] * float(q)
-            daily_nav = port_ts + current_cash
+        for i, p_tab in enumerate(period_tabs):
+            p_key = list(deltas.keys())[i]
+            days = deltas[p_key]
             
-            norm_nav = (daily_nav / daily_nav.iloc[0] - 1) * 100
-            cols = st.columns(len(BENCHMARKS) + 1)
-            cols[0].metric("Portfolio Return", f"{norm_nav.iloc[-1]:.2f}%")
-            for i, (name, sym) in enumerate(BENCHMARKS.items()):
-                if sym in filtered_prices.columns:
-                    b_ret = (filtered_prices[sym].iloc[-1] / filtered_prices[sym].iloc[0] - 1) * 100
-                    cols[i+1].metric(f"{name} Return", f"{b_ret:.2f}%")
+            with p_tab:
+                start_f = abs_start if days is None else max(abs_start, today - timedelta(days=days))
+                filtered_prices = all_prices[all_prices.index.date >= start_f]
+                
+                if not filtered_prices.empty:
+                    port_ts = pd.Series(0.0, index=filtered_prices.index)
+                    for t, q in holdings.items():
+                        if t in filtered_prices.columns: port_ts += filtered_prices[t] * float(q)
+                    daily_nav = port_ts + current_cash
+                    
+                    # Metrics Row
+                    m_cols = st.columns(len(BENCHMARKS) + 1)
+                    p_ret = (daily_nav.iloc[-1] / daily_nav.iloc[0] - 1) * 100
+                    m_cols[0].metric("Portfolio Return", f"{p_ret:.2f}%")
+                    
+                    for idx, (name, sym) in enumerate(BENCHMARKS.items()):
+                        if sym in filtered_prices.columns:
+                            b_ret = (filtered_prices[sym].iloc[-1] / filtered_prices[sym].iloc[0] - 1) * 100
+                            m_cols[idx+1].metric(f"{name}", f"{b_ret:.2f}%")
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=daily_nav.index, y=(daily_nav/daily_nav.iloc[0])*100, name="Portfolio", line=dict(color='#00ff88', width=3)))
-            for name, sym in BENCHMARKS.items():
-                if sym in filtered_prices.columns:
-                    fig.add_trace(go.Scatter(x=filtered_prices.index, y=(filtered_prices[sym]/filtered_prices[sym].iloc[0])*100, name=name, line=dict(dash='dot')))
-            fig.update_layout(template="plotly_dark", height=450, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+                    # Plotly Chart
+                    fig = go.Figure()
+                    # Normalized Portfolio
+                    fig.add_trace(go.Scatter(
+                        x=daily_nav.index, 
+                        y=(daily_nav/daily_nav.iloc[0])*100, 
+                        name="Portfolio", 
+                        line=dict(color='#00ff88', width=3),
+                        hovertemplate='Portfolio: %{y:.2f}%<extra></extra>'
+                    ))
+                    # Normalized Benchmarks
+                    for name, sym in BENCHMARKS.items():
+                        if sym in filtered_prices.columns:
+                            fig.add_trace(go.Scatter(
+                                x=filtered_prices.index, 
+                                y=(filtered_prices[sym]/filtered_prices[sym].iloc[0])*100, 
+                                name=name, 
+                                line=dict(dash='dot'),
+                                hovertemplate=f'{name}: %{{y:.2f}}%<extra></extra>'
+                            ))
 
-    with tab2:
+                    fig.update_layout(
+                        template="plotly_dark", 
+                        height=500, 
+                        hovermode="x unified",
+                        margin=dict(l=20, r=20, t=30, b=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"chart_{p_key}")
+
+    with tab_comp:
         st.subheader("Current Composition")
-        curr_total = daily_nav.iloc[-1]
+        # Reuse daily_nav from the last calculation to get current total
+        curr_total = (pd.Series({t: all_prices[t].iloc[-1] * float(q) for t, q in holdings.items() if t in all_prices.columns}).sum()) + current_cash
         comp_data = []
-        # Add Stocks
         for t, q in holdings.items():
-            if float(q) > 0 and t in filtered_prices.columns:
-                val = float(q) * filtered_prices[t].iloc[-1]
-                try: sector = yf.Ticker(t).info.get('sector', 'N/A')
-                except: sector = "N/A"
-                comp_data.append({"Ticker": t, "Value": val, "Weight (%)": (val/curr_total)*100, "Sector": sector})
-        # Add Cash back in
-        comp_data.append({"Ticker": "CASH", "Value": current_cash, "Weight (%)": (current_cash/curr_total)*100, "Sector": "Liquid"})
+            if float(q) > 0 and t in all_prices.columns:
+                val = float(q) * all_prices[t].iloc[-1]
+                comp_data.append({"Ticker": t, "Value": val, "Weight (%)": (val/curr_total)*100})
         
+        comp_data.append({"Ticker": "CASH", "Value": current_cash, "Weight (%)": (current_cash/curr_total)*100})
         comp_df = pd.DataFrame(comp_data)
         st.dataframe(comp_df.style.format({"Value": "₹{:,.2f}", "Weight (%)": "{:.2f}%"}), use_container_width=True, hide_index=True)
 
-    with tab3:
-        st.subheader("Market Intelligence")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("#### 📅 Corporate Actions")
-            for t in ticker_list[:5]:
-                act = yf.Ticker(t).actions
-                if not act.empty:
-                    st.caption(f"**{t.split('.')[0]}**")
-                    act_df = act.tail(2).copy()
-                    act_df.index = pd.to_datetime(act_df.index).date
-                    st.table(act_df)
-        with col_b:
-            st.markdown("#### 🤖 Key News Summaries")
-            for t in ticker_list[:5]:
-                try:
-                    # Use yf.Search for better Indian market reliability
-                    s = yf.Search(t, news_count=1)
-                    news = s.news
-                    if news:
-                        st.info(f"**{t.split('.')[0]}**")
-                        st.write(f"**Driver:** {news[0].get('title')}")
-                        st.caption(f"Source: {news[0].get('publisher')}")
-                    else: st.caption(f"No news found for {t}")
-                except: pass
-                st.divider()
+    with tab_ins:
+        st.subheader("Corporate Actions")
+        for t in ticker_list[:10]:
+            act = yf.Ticker(t).actions
+            if not act.empty:
+                st.write(f"**{t}**")
+                st.table(act.tail(3))
