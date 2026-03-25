@@ -17,7 +17,7 @@ st.set_page_config(page_title="Moonshot NAV Intelligence", layout="wide", page_i
 # --- DATABASE ENGINE ---
 def save_to_excel(init_df, trans_df, meta_df):
     m_copy = meta_df.copy()
-    t_copy = trans_df.copy()
+    t_copy = trans_db.copy() if trans_db is not None else trans_df.copy()
     if 'Date' in m_copy.columns: m_copy['Date'] = pd.to_datetime(m_copy['Date']).dt.date
     if 'Date' in t_copy.columns: t_copy['Date'] = pd.to_datetime(t_copy['Date']).dt.date
     with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
@@ -77,7 +77,6 @@ else:
     abs_start = pd.to_datetime(meta_db['Date'].iloc[0]).date()
     today = datetime.now().date()
     
-    # CALCULATIONS
     with st.spinner("Calculating Performance..."):
         holdings = {}
         total_val = float(meta_db['Total_Value'].iloc[0])
@@ -104,12 +103,10 @@ else:
     tab1, tab2, tab3 = st.tabs(["📈 Performance", "🏢 Portfolio", "🔔 Insights & AI Summary"])
 
     with tab1:
-        # 1W to MAX PERIOD SELECTOR
         duration = st.select_slider("Select Time Period", options=["1W", "1M", "6M", "1Yr", "3Yr", "5Yr", "Max"], value="Max")
         deltas = {"1W": 7, "1M": 30, "6M": 182, "1Yr": 365, "3Yr": 1095, "5Yr": 1825}
         start_f = abs_start if duration == "Max" else max(abs_start, today - timedelta(days=deltas[duration]))
         
-        # Filter data for selected period
         filtered_prices = all_prices[all_prices.index.date >= start_f]
         if not filtered_prices.empty:
             port_ts = pd.Series(0.0, index=filtered_prices.index)
@@ -117,7 +114,6 @@ else:
                 if t in filtered_prices.columns: port_ts += filtered_prices[t] * float(q)
             daily_nav = port_ts + current_cash
             
-            # Metric Row: % Changes
             norm_nav = (daily_nav / daily_nav.iloc[0] - 1) * 100
             cols = st.columns(len(BENCHMARKS) + 1)
             cols[0].metric("Portfolio Return", f"{norm_nav.iloc[-1]:.2f}%")
@@ -138,12 +134,16 @@ else:
         st.subheader("Current Composition")
         curr_total = daily_nav.iloc[-1]
         comp_data = []
+        # Add Stocks
         for t, q in holdings.items():
-            if float(q) > 0:
+            if float(q) > 0 and t in filtered_prices.columns:
                 val = float(q) * filtered_prices[t].iloc[-1]
                 try: sector = yf.Ticker(t).info.get('sector', 'N/A')
                 except: sector = "N/A"
                 comp_data.append({"Ticker": t, "Value": val, "Weight (%)": (val/curr_total)*100, "Sector": sector})
+        # Add Cash back in
+        comp_data.append({"Ticker": "CASH", "Value": current_cash, "Weight (%)": (current_cash/curr_total)*100, "Sector": "Liquid"})
+        
         comp_df = pd.DataFrame(comp_data)
         st.dataframe(comp_df.style.format({"Value": "₹{:,.2f}", "Weight (%)": "{:.2f}%"}), use_container_width=True, hide_index=True)
 
@@ -161,13 +161,15 @@ else:
                     st.table(act_df)
         with col_b:
             st.markdown("#### 🤖 Key News Summaries")
-            for t in ticker_list[:8]:
+            for t in ticker_list[:5]:
                 try:
-                    news = yf.Ticker(t).news
-                    if news and len(news) > 0:
+                    # Use yf.Search for better Indian market reliability
+                    s = yf.Search(t, news_count=1)
+                    news = s.news
+                    if news:
                         st.info(f"**{t.split('.')[0]}**")
                         st.write(f"**Driver:** {news[0].get('title')}")
-                        st.caption(f"Source: {news[0].get('publisher')} | Sector context applied.")
-                    else: st.caption(f"No recent movement drivers for {t}")
+                        st.caption(f"Source: {news[0].get('publisher')}")
+                    else: st.caption(f"No news found for {t}")
                 except: pass
                 st.divider()
