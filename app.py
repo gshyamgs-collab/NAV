@@ -2,10 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import os
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 import yfinance as yf
+from datetime import datetime, timedelta
 
 # --- CONFIG ---
 DB_FILE = "moonshot_portfolio.xlsx"
@@ -16,28 +14,21 @@ BENCHMARKS = {
 
 st.set_page_config(page_title="Moonshot NAV Intelligence", layout="wide", page_icon="🚀")
 
-# --- UTILITIES ---
+# --- CORE UTILITIES ---
 def clean_ticker(t):
-    """Standardizes any input to a clean symbol for Yahoo/Google lookup"""
     if not t or pd.isna(t): return ""
     t = str(t).strip().upper()
     if ":" in t: t = t.split(":")[-1]
-    if t.endswith(".NS"): t = t.replace(".NS", "")
+    if not t.endswith(".NS") and not t.startswith("^"): t = f"{t}.NS"
     return t
 
-def get_google_price(ticker):
-    """Scrapes Google Finance for real-time price"""
+def get_live_price(ticker):
+    """Fast fetch for current price"""
     try:
-        symbol = clean_ticker(ticker)
-        url = f"https://www.google.com/finance/quote/{symbol}:NSE"
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        price_div = soup.find("div", {"class": "YMlS1d"})
-        if price_div:
-            return float(price_div.text.replace('₹', '').replace(',', '').strip())
+        t_obj = yf.Ticker(clean_ticker(ticker))
+        return t_obj.fast_info['last_price']
     except:
         return None
-    return None
 
 # --- DATABASE ENGINE ---
 def save_to_excel(init_df, trans_df, meta_df):
@@ -62,40 +53,42 @@ init_db, trans_db, meta_db = load_from_excel()
 if 'locked' not in st.session_state:
     st.session_state['locked'] = False
 
-# --- SIDEBAR: TICKER SEARCH TOOL ---
-st.sidebar.header("🔍 Ticker Search Tool")
-search_q = st.sidebar.text_input("Search (e.g. INFOSYS, TCS)", "").upper()
-if search_q:
-    s_price = get_google_price(search_q)
-    if s_price:
-        st.sidebar.success(f"✅ {search_q}: ₹{s_price}")
-        st.sidebar.caption("Symbol is valid for Portfolio Entry")
-    else:
-        st.sidebar.error("❌ Symbol not found on NSE")
-
-st.sidebar.divider()
-if st.sidebar.button("🔓 Unlock & Edit Data"):
-    st.session_state['locked'] = False
-    st.rerun()
+# --- SIDEBAR UI ---
+with st.sidebar:
+    st.header("🔍 Ticker Search")
+    search_q = st.text_input("Search (e.g. RELIANCE, TCS)", "").upper()
+    if search_q:
+        lp = get_live_price(search_q)
+        if lp:
+            st.success(f"**{search_q}**: ₹{lp:,.2f}")
+            st.caption("Valid Ticker for Entry")
+        else:
+            st.error("Invalid Ticker")
+    
+    st.divider()
+    if st.button("🔓 Unlock & Edit Portfolio", use_container_width=True):
+        st.session_state['locked'] = False
+        st.rerun()
 
 # --- ENTRY MODE ---
 if not st.session_state['locked']:
-    st.markdown("### 📝 Portfolio Data Entry")
+    st.info("💡 Tip: Use simple names like RELIANCE or HDFCBANK. The app adds .NS automatically.")
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        m_df = meta_db if meta_db is not None else pd.DataFrame([{"Date": "2025-01-01", "Total_Value": 100000.0, "Cash_Percent": 10.0}])
-        edited_meta = st.data_editor(m_df, key="meta_edit", use_container_width=True)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.subheader("1. Global Settings")
+        m_df = meta_db if meta_db is not None else pd.DataFrame([{"Date": "2024-01-01", "Total_Value": 1000000.0, "Cash_Percent": 10.0}])
+        edited_meta = st.data_editor(m_df, key="meta_edit")
     
-    st.write("**1. Initial Setup (Weights must add to 100% with Cash)**")
+    st.subheader("2. Initial Weights")
     i_df = init_db if init_db is not None else pd.DataFrame([{"Ticker": "RELIANCE", "Weight_Percent": 90.0}])
     edited_init = st.data_editor(i_df, num_rows="dynamic", key="init_edit", use_container_width=True)
     
-    st.write("**2. Ongoing Transactions**")
+    st.subheader("3. Transaction Ledger")
     t_df = trans_db if trans_db is not None else pd.DataFrame(columns=["Date", "Type", "Ticker", "Qty", "Amount"])
     edited_trans = st.data_editor(t_df, num_rows="dynamic", key="trans_edit", use_container_width=True)
 
-    if st.button("🔒 Save & Generate Analysis"):
+    if st.button("🔒 Save & Generate Analysis", type="primary"):
         save_to_excel(edited_init, edited_trans, edited_meta)
         st.session_state['locked'] = True
         st.rerun()
@@ -104,98 +97,116 @@ if not st.session_state['locked']:
 # --- ANALYTICS MODE ---
 else:
     abs_start = pd.to_datetime(meta_db['Date'].iloc[0])
-    today = datetime.now()
     
-    with st.spinner("Processing Portfolio Data..."):
-        # Map Holdings
+    with st.spinner("Crunching Portfolio Data..."):
         holdings_qty = {}
-        initial_capital = float(meta_db['Total_Value'].iloc[0])
+        total_initial = float(meta_db['Total_Value'].iloc[0])
+        cash_initial = total_initial * (float(meta_db['Cash_Percent'].iloc[0])/100)
         
-        # Step A: Calculate Initial Units
+        # Step 1: Initial Quantities
         for _, row in init_db.iterrows():
-            sym = clean_ticker(row['Ticker'])
-            weight = float(row['Weight_Percent']) / 100
-            yf_sym = f"{sym}.NS"
-            
-            # Fetch price at start date
-            data = yf.download(yf_sym, start=abs_start, end=abs_start + timedelta(days=7), progress=False)
-            if not data.empty:
-                start_px = float(data['Close'].iloc[0])
-                holdings_qty[yf_sym] = (initial_capital * weight) / start_px
+            tk = clean_ticker(row['Ticker'])
+            weight_val = (total_initial * (float(row['Weight_Percent'])/100))
+            hist = yf.download(tk, start=abs_start, end=abs_start + timedelta(days=7), progress=False)
+            if not hist.empty:
+                holdings_qty[tk] = weight_val / float(hist['Close'].iloc[0])
 
-        # Step B: Adjust for Transactions
+        # Step 2: Transaction Adjustments
+        current_cash = cash_initial
         if trans_db is not None and not trans_db.empty:
             for _, row in trans_db.iterrows():
-                sym = f"{clean_ticker(row['Ticker'])}.NS"
+                tk = clean_ticker(row['Ticker'])
                 qty = float(row['Qty'])
+                amt = float(row['Amount'])
                 if row['Type'] == "BUY":
-                    holdings_qty[sym] = holdings_qty.get(sym, 0) + qty
+                    holdings_qty[tk] = holdings_qty.get(tk, 0) + qty
+                    current_cash -= amt
                 else:
-                    holdings_qty[sym] = holdings_qty.get(sym, 0) - qty
+                    holdings_qty[tk] = holdings_qty.get(tk, 0) - qty
+                    current_cash += amt
 
-        # Step C: Load All History
-        active_tickers = [t for t, q in holdings_qty.items() if q != 0]
-        all_symbols = active_tickers + list(BENCHMARKS.values())
-        df_history = yf.download(all_symbols, start=abs_start, progress=False)['Close'].ffill()
+        # Step 3: Global History
+        all_tk = list(holdings_qty.keys()) + list(BENCHMARKS.values())
+        df_hist = yf.download(all_tk, start=abs_start, progress=False)['Close'].ffill()
 
-    # --- UI TABS ---
-    tab1, tab2 = st.tabs(["📈 NAV Performance", "🏢 Current Holdings"])
+    # --- UI DASHBOARD ---
+    t1, t2 = st.tabs(["📈 Performance Hub", "🏢 Portfolio Holdings"])
 
-    with tab1:
-        st.write("### Portfolio NAV vs Benchmarks")
-        periods = {"1W": 7, "1M": 30, "6M": 180, "1Y": 365, "Max": None}
-        p_choice = st.radio("Select Period", list(periods.keys()), horizontal=True)
+    with t1:
+        st.write("### NAV Performance vs Benchmarks")
+        p_map = {"1W": 7, "1M": 30, "6M": 180, "1Y": 365, "3Y": 1095, "5Y": 1825, "Max": None}
+        p_sel = st.radio("Timeframe", list(p_map.keys()), horizontal=True)
         
-        # Filter data by period
-        if periods[p_choice]:
-            filter_date = today - timedelta(days=periods[p_choice])
-            plot_df = df_history[df_history.index >= filter_date]
+        # Date Filtering
+        if p_map[p_sel]:
+            start_f = datetime.now() - timedelta(days=p_map[p_sel])
+            plot_df = df_hist[df_hist.index >= start_f]
         else:
-            plot_df = df_history
+            plot_df = df_hist
 
         if not plot_df.empty:
-            # Calculate Portfolio NAV Series
+            # Portfolio NAV Calculation
             port_val = pd.Series(0.0, index=plot_df.index)
-            for t, q in holdings_qty.items():
-                if t in plot_df.columns:
-                    port_val += plot_df[t] * q
+            for tk, q in holdings_qty.items():
+                if tk in plot_df.columns: port_val += plot_df[tk] * q
             
-            cash_val = initial_capital * (float(meta_db['Cash_Percent'].iloc[0])/100)
-            daily_nav = port_val + cash_val
+            daily_nav = port_val + current_cash
             
-            # Metrics
-            m1, m2 = st.columns(2)
-            ret = ((daily_nav.iloc[-1] / daily_nav.iloc[0]) - 1) * 100
-            m1.metric("Current Value", f"₹{daily_nav.iloc[-1]:,.2f}")
-            m2.metric(f"{p_choice} Return", f"{ret:.2f}%")
-
-            # Chart
+            # Metric Bar
+            m1, m2, m3 = st.columns(3)
+            curr_v = daily_nav.iloc[-1]
+            period_ret = ((curr_v / daily_nav.iloc[0]) - 1) * 100
+            m1.metric("Current NAV", f"₹{curr_v:,.2f}")
+            m2.metric(f"{p_sel} Return", f"{period_ret:.2f}%")
+            
+            # Performance Chart
             fig = go.Figure()
+            # Normalize to 100 at start of period
             fig.add_trace(go.Scatter(x=daily_nav.index, y=(daily_nav/daily_nav.iloc[0])*100, 
-                                     name="Portfolio", line=dict(color='#00ff88', width=3)))
+                                     name="Portfolio", line=dict(color='#00ff88', width=4)))
             
             for b_name, b_sym in BENCHMARKS.items():
                 if b_sym in plot_df.columns:
-                    fig.add_trace(go.Scatter(x=plot_df.index, y=(plot_df[b_sym]/plot_df[b_sym].iloc[0])*100, 
-                                             name=b_name, line=dict(dash='dot')))
-            
-            fig.update_layout(template="plotly_dark", height=500, hovermode="x unified",
-                              yaxis_title="Indexed Value (Base 100)")
+                    b_series = plot_df[b_sym]
+                    fig.add_trace(go.Scatter(x=b_series.index, y=(b_series/b_series.iloc[0])*100, 
+                                             name=b_name, line=dict(dash='dot', width=1.5)))
+
+            fig.update_layout(template="plotly_dark", height=550, hovermode="x unified",
+                              yaxis_title="Indexed Value (Start = 100)")
             st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
-        st.subheader("Current Composition")
-        h_list = []
-        for t, q in holdings_qty.items():
+    with t2:
+        st.subheader("Asset Allocation")
+        h_data = []
+        # Add Stocks
+        for tk, q in holdings_qty.items():
             if q > 0:
-                l_price = get_google_price(t) or float(df_history[t].iloc[-1])
-                cur_val = q * l_price
-                h_list.append({
-                    "Ticker": t.replace(".NS", ""),
+                px = float(df_hist[tk].iloc[-1])
+                val = q * px
+                h_data.append({
+                    "Asset": tk.replace(".NS", ""),
+                    "Category": "Equity",
                     "Quantity": round(q, 2),
-                    "Live Price": round(l_price, 2),
-                    "Market Value": round(cur_val, 2),
-                    "Weight %": round((cur_val / daily_nav.iloc[-1]) * 100, 2)
+                    "Price": f"₹{px:,.2f}",
+                    "Value": round(val, 2),
+                    "Weight": round((val / curr_v) * 100, 2)
                 })
         
-        st.dataframe(pd.DataFrame(h_list), use_container_width=True, hide_index=True)
+        # Add Cash explicitly
+        h_data.append({
+            "Asset": "CASH",
+            "Category": "Cash",
+            "Quantity": 1.0,
+            "Price": f"₹{current_cash:,.2f}",
+            "Value": round(current_cash, 2),
+            "Weight": round((current_cash / curr_v) * 100, 2)
+        })
+        
+        h_df = pd.DataFrame(h_data).sort_values("Value", ascending=False)
+        st.dataframe(h_df.style.format({"Value": "₹{:,.2f}", "Weight": "{:.2f}%"}), 
+                     use_container_width=True, hide_index=True)
+        
+        # Allocation Chart
+        fig_pie = go.Figure(data=[go.Pie(labels=h_df['Asset'], values=h_df['Value'], hole=.4)])
+        fig_pie.update_layout(template="plotly_dark", title="Portfolio Concentration")
+        st.plotly_chart(fig_pie)
