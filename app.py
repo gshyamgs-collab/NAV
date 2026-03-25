@@ -2,124 +2,174 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import os
 from datetime import datetime, timedelta
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Equity Research Automator", layout="wide")
+# --- CONFIG ---
+DB_FILE = "moonshot_portfolio.xlsx"
+BENCHMARKS = {
+    "Nifty 50": "^NSEI",
+    "Nifty Midcap 150": "^NSEMDCP150"
+}
 
-# --- CUSTOM STYLING ---
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_all_window_密=True)
+st.set_page_config(page_title="Moonshot NAV Intelligence", layout="wide", page_icon="🚀")
 
-# --- SIDEBAR: NAVIGATION & PORTFOLIO ---
-with st.sidebar:
-    st.title("📊 Portfolio Hub")
-    
-    # Quick Ticker Search
-    search_ticker = st.text_input("Enter Ticker (e.g., SYNGENE.NS, PIIND.NS)", value="SYNGENE.NS").upper()
-    
-    st.divider()
-    st.subheader("Sector Benchmarks")
-    # Using correct 2026 tickers for Midcap indices
-    benchmarks = {
-        "Nifty Midcap 100": "^NSEMDCP100",
-        "Nifty Midcap 150": "NIFTY_MIDCAP_150.NS" 
-    }
-    selected_benchmark = st.selectbox("Compare with:", list(benchmarks.keys()))
+# --- DATABASE ENGINE ---
+def save_to_excel(init_df, trans_df, meta_df):
+    m_copy = meta_df.copy()
+    t_copy = trans_db.copy() if trans_db is not None else trans_df.copy()
+    if 'Date' in m_copy.columns: m_copy['Date'] = pd.to_datetime(m_copy['Date']).dt.date
+    if 'Date' in t_copy.columns: t_copy['Date'] = pd.to_datetime(t_copy['Date']).dt.date
+    with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
+        init_df.to_excel(writer, sheet_name="Initial_Setup", index=False)
+        t_copy.to_excel(writer, sheet_name="Transactions", index=False)
+        m_copy.to_excel(writer, sheet_name="Metadata", index=False)
 
-# --- DATA FETCHING FUNCTIONS ---
-@st.cache_data(ttl=3600)
-def get_stock_data(ticker, period="1y"):
+def load_from_excel():
+    if not os.path.exists(DB_FILE): return None, None, None
     try:
-        data = yf.download(ticker, period=period, interval="1d")
-        info = yf.Ticker(ticker).info
-        return data, info
-    except Exception as e:
-        return None, None
+        init = pd.read_excel(DB_FILE, sheet_name="Initial_Setup")
+        trans = pd.read_excel(DB_FILE, sheet_name="Transactions")
+        meta = pd.read_excel(DB_FILE, sheet_name="Metadata")
+        if 'Date' in meta.columns: meta['Date'] = pd.to_datetime(meta['Date']).dt.date
+        if 'Date' in trans.columns: trans['Date'] = pd.to_datetime(trans['Date']).dt.date
+        return init, trans, meta
+    except: return None, None, None
 
-# --- MAIN INTERFACE ---
-st.title(f"Strategic Research: {search_ticker}")
+def format_ticker(t):
+    if not t or pd.isna(t): return ""
+    t = str(t).strip().upper()
+    if t in ["CASH", ""]: return "CASH"
+    return f"{t}.NS" if not t.endswith('.NS') and not t.startswith('^') else t
 
-hist_data, ticker_info = get_stock_data(search_ticker)
+# --- APP START ---
+st.title("🚀 Moonshot NAV Intelligence")
+init_db, trans_db, meta_db = load_from_excel()
 
-if hist_data is not None and not hist_data.empty:
-    # 1. TOP METRICS ROW
-    col1, col2, col3, col4 = st.columns(4)
-    curr_price = hist_data['Close'].iloc[-1]
-    prev_price = hist_data['Close'].iloc[-2]
-    change = ((curr_price - prev_price) / prev_price) * 100
+if 'locked' not in st.session_state:
+    st.session_state['locked'] = False
 
-    col1.metric("Current Price", f"₹{curr_price:,.2f}", f"{change:+.2f}%")
-    col2.metric("Market Cap", f"₹{ticker_info.get('marketCap', 0)/1e7:,.0f} Cr")
-    col3.metric("P/E Ratio", f"{ticker_info.get('trailingPE', 'N/A')}")
-    col4.metric("52W High", f"₹{ticker_info.get('fiftyTwoWeekHigh', 0):,.2f}")
+st.sidebar.header("🕹️ Controls")
+if st.sidebar.button("🔓 Unlock & Edit Data"):
+    st.session_state['locked'] = False
+    st.rerun()
 
-    # 2. TABS FOR DEEP DIVE
-    tab_chart, tab_fundamental, tab_news = st.tabs(["📈 Technical Chart", "🧬 Fundamental Analysis", "📰 News & Sentiment"])
+if not st.session_state['locked']:
+    st.markdown("### 📝 Portfolio Data Entry")
+    m_df = meta_db if meta_db is not None else pd.DataFrame([{"Date": datetime(2025, 1, 1).date(), "Total_Value": 100000.0, "Cash_Percent": 10.0}])
+    edited_meta = st.data_editor(m_df, key="meta_edit", use_container_width=True)
+    i_df = init_db if init_db is not None else pd.DataFrame([{"Ticker": "RELIANCE", "Weight_Percent": 90.0}])
+    edited_init = st.data_editor(i_df, num_rows="dynamic", key="init_edit", use_container_width=True)
+    t_df = trans_db if trans_db is not None else pd.DataFrame(columns=["Date", "Type", "Ticker", "Qty", "Amount"])
+    edited_trans = st.data_editor(t_df, num_rows="dynamic", key="trans_edit", use_container_width=True)
 
-    with tab_chart:
-        # Time Period Selector for Chart
-        period_col1, period_col2 = st.columns([1, 4])
-        with period_col1:
-            time_frame = st.radio("Time Frame", ["1M", "3M", "6M", "1Y", "5Y"], index=3, horizontal=True)
-        
-        # Plotly Candlestick Chart
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=hist_data.index,
-            open=hist_data['Open'],
-            high=hist_data['High'],
-            low=hist_data['Low'],
-            close=hist_data['Close'],
-            name='Price'
-        ))
-        
-        # Add a Moving Average
-        hist_data['MA50'] = hist_data['Close'].rolling(window=50).mean()
-        fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['MA50'], line=dict(color='orange', width=1), name='50 Day MA'))
-
-        fig.update_layout(
-            template="plotly_white",
-            xaxis_rangeslider_visible=False,
-            height=500,
-            margin=dict(l=20, r=20, t=30, b=20)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab_fundamental:
-        st.subheader("Key Ratios & Value Chain Info")
-        f_col1, f_col2 = st.columns(2)
-        
-        with f_col1:
-            st.write("**Margins & Efficiency**")
-            st.write(f"- Operating Margin: {ticker_info.get('operatingMargins', 0)*100:.2f}%")
-            st.write(f"- ROE: {ticker_info.get('returnOnEquity', 0)*100:.2f}%")
-            st.write(f"- Debt to Equity: {ticker_info.get('debtToEquity', 'N/A')}")
-
-        with f_col2:
-            st.write("**Growth Metrics**")
-            st.write(f"- Revenue Growth (YoY): {ticker_info.get('revenueGrowth', 0)*100:.2f}%")
-            st.write(f"- Earnings Growth (YoY): {ticker_info.get('earningsGrowth', 0)*100:.2f}%")
-            st.write(f"- Dividend Yield: {ticker_info.get('dividendYield', 0)*100:.2f}%")
-
-    with tab_news:
-        st.subheader(f"Latest Market Intelligence for {search_ticker}")
-        news = yf.Ticker(search_ticker).news
-        if news:
-            for item in news[:5]:
-                with st.expander(item['title']):
-                    st.write(f"**Publisher:** {item['publisher']}")
-                    st.write(f"**Link:** [Read Article]({item['link']})")
+    if st.button("🔒 Save & Lock to Analyze"):
+        total_w = edited_init["Weight_Percent"].sum() + edited_meta["Cash_Percent"].iloc[0]
+        if round(total_w, 2) == 100.0:
+            save_to_excel(edited_init, edited_trans, edited_meta)
+            st.session_state['locked'] = True
+            st.rerun()
         else:
-            st.info("No recent news found for this ticker.")
+            st.error(f"Total Weight must be 100% (Current: {total_w}%)")
+    st.stop()
 
 else:
-    st.error("Ticker not found. Please ensure you include the '.NS' suffix for Indian stocks (e.g., RELIANCE.NS).")
+    abs_start = pd.to_datetime(meta_db['Date'].iloc[0]).date()
+    today = datetime.now().date()
+    
+    with st.spinner("Calculating Performance..."):
+        holdings = {}
+        total_val = float(meta_db['Total_Value'].iloc[0])
+        for _, row in init_db.iterrows():
+            t = format_ticker(row['Ticker'])
+            w = float(row['Weight_Percent']) / 100
+            p_df = yf.download(t, start=abs_start, end=abs_start + timedelta(days=7), progress=False)['Close']
+            if not p_df.empty: holdings[t] = holdings.get(t, 0.0) + float((total_val * w) / p_df.iloc[0])
 
-# --- FOOTER / AUTOMATION STATUS ---
-st.divider()
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Data source: Yahoo Finance")
+        current_cash = total_val * (float(meta_db['Cash_Percent'].iloc[0]) / 100)
+        if trans_db is not None and not trans_db.empty:
+            for _, row in trans_db.iterrows():
+                t = format_ticker(row['Ticker'])
+                if row['Type'] == "BUY":
+                    holdings[t] = holdings.get(t, 0.0) + float(row['Qty'])
+                    current_cash -= float(row['Amount'])
+                elif row['Type'] == "SELL":
+                    holdings[t] = holdings.get(t, 0.0) - float(row['Qty'])
+                    current_cash += float(row['Amount'])
+
+        ticker_list = [t for t in holdings.keys() if t != "CASH"]
+        all_prices = yf.download(ticker_list + list(BENCHMARKS.values()), start=abs_start, end=today, progress=False)['Close'].ffill()
+
+    tab1, tab2, tab3 = st.tabs(["📈 Performance", "🏢 Portfolio", "🔔 Insights & AI Summary"])
+
+    with tab1:
+        duration = st.select_slider("Select Time Period", options=["1W", "1M", "6M", "1Yr", "3Yr", "5Yr", "Max"], value="Max")
+        deltas = {"1W": 7, "1M": 30, "6M": 182, "1Yr": 365, "3Yr": 1095, "5Yr": 1825}
+        start_f = abs_start if duration == "Max" else max(abs_start, today - timedelta(days=deltas[duration]))
+        
+        filtered_prices = all_prices[all_prices.index.date >= start_f]
+        if not filtered_prices.empty:
+            port_ts = pd.Series(0.0, index=filtered_prices.index)
+            for t, q in holdings.items():
+                if t in filtered_prices.columns: port_ts += filtered_prices[t] * float(q)
+            daily_nav = port_ts + current_cash
+            
+            norm_nav = (daily_nav / daily_nav.iloc[0] - 1) * 100
+            cols = st.columns(len(BENCHMARKS) + 1)
+            cols[0].metric("Portfolio Return", f"{norm_nav.iloc[-1]:.2f}%")
+            for i, (name, sym) in enumerate(BENCHMARKS.items()):
+                if sym in filtered_prices.columns:
+                    b_ret = (filtered_prices[sym].iloc[-1] / filtered_prices[sym].iloc[0] - 1) * 100
+                    cols[i+1].metric(f"{name} Return", f"{b_ret:.2f}%")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=daily_nav.index, y=(daily_nav/daily_nav.iloc[0])*100, name="Portfolio", line=dict(color='#00ff88', width=3)))
+            for name, sym in BENCHMARKS.items():
+                if sym in filtered_prices.columns:
+                    fig.add_trace(go.Scatter(x=filtered_prices.index, y=(filtered_prices[sym]/filtered_prices[sym].iloc[0])*100, name=name, line=dict(dash='dot')))
+            fig.update_layout(template="plotly_dark", height=450, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        st.subheader("Current Composition")
+        curr_total = daily_nav.iloc[-1]
+        comp_data = []
+        # Add Stocks
+        for t, q in holdings.items():
+            if float(q) > 0 and t in filtered_prices.columns:
+                val = float(q) * filtered_prices[t].iloc[-1]
+                try: sector = yf.Ticker(t).info.get('sector', 'N/A')
+                except: sector = "N/A"
+                comp_data.append({"Ticker": t, "Value": val, "Weight (%)": (val/curr_total)*100, "Sector": sector})
+        # Add Cash back in
+        comp_data.append({"Ticker": "CASH", "Value": current_cash, "Weight (%)": (current_cash/curr_total)*100, "Sector": "Liquid"})
+        
+        comp_df = pd.DataFrame(comp_data)
+        st.dataframe(comp_df.style.format({"Value": "₹{:,.2f}", "Weight (%)": "{:.2f}%"}), use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.subheader("Market Intelligence")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("#### 📅 Corporate Actions")
+            for t in ticker_list[:5]:
+                act = yf.Ticker(t).actions
+                if not act.empty:
+                    st.caption(f"**{t.split('.')[0]}**")
+                    act_df = act.tail(2).copy()
+                    act_df.index = pd.to_datetime(act_df.index).date
+                    st.table(act_df)
+        with col_b:
+            st.markdown("#### 🤖 Key News Summaries")
+            for t in ticker_list[:5]:
+                try:
+                    # Use yf.Search for better Indian market reliability
+                    s = yf.Search(t, news_count=1)
+                    news = s.news
+                    if news:
+                        st.info(f"**{t.split('.')[0]}**")
+                        st.write(f"**Driver:** {news[0].get('title')}")
+                        st.caption(f"Source: {news[0].get('publisher')}")
+                    else: st.caption(f"No news found for {t}")
+                except: pass
+                st.divider()
