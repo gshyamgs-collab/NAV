@@ -1,109 +1,143 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- APP CONFIGURATION ---
-st.set_page_config(page_title="Portfolio Command Center", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("<style>button{border-radius: 8px;} .stMetric{background-color: #1e2130; padding: 15px; border-radius: 10px;}</style>", unsafe_allow_html=True)
+# Page Configuration
+st.set_page_config(page_title="Indian Stock Educator & NAV Tracker", layout="wide")
 
-st.title("🏛️ Sovereign Fund Command Center")
-st.subheader("Fundamental Equity Analysis & Unitized NAV Tracker")
+def format_ticker(ticker):
+    """Appends .NS to Indian tickers if not present."""
+    ticker = ticker.strip().upper()
+    if ticker and not ticker.endswith('.NS') and not ticker.startswith('^'):
+        return f"{ticker}.NS"
+    return ticker
 
-# --- DATA INPUT SECTION ---
-with st.sidebar:
-    st.header("⚙️ Data Source")
-    data_mode = st.radio("Choose Input Mode:", ["Upload Excel/CSV", "Google Sheet URL"])
-    
-    if data_mode == "Upload Excel/CSV":
-        uploaded_file = st.file_uploader("Upload Transaction Log", type=["xlsx", "csv"])
-    else:
-        sheet_url = st.text_input("Paste Public Google Sheet URL:")
-        # Convert sharing link to export link
-        if "edit" in sheet_url:
-            uploaded_file = sheet_url.replace('/edit#gid=', '/export?format=csv&gid=')
-        else:
-            uploaded_file = None
-
-# --- THE ENGINE: CALCULATION LOGIC ---
 @st.cache_data(ttl=3600)
-def process_performance(file):
-    if file is None: return None
-    
-    # 1. Load Data
-    df = pd.read_csv(file) if isinstance(file, str) else pd.read_excel(file)
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date')
-    
-    # 2. Market Data
-    tickers = [f"{t}.NS" for t in df['Ticker'].dropna().unique()]
-    benchmarks = ["^NSEI", "^NSEMDCP100"]
-    all_data = yf.download(tickers + benchmarks, start=df['Date'].min(), end=datetime.now())['Adj Close'].ffill()
-    
-    # 3. NAV Unitization Logic
-    date_range = pd.date_range(df['Date'].min(), datetime.now(), freq='B')
-    history = pd.DataFrame(index=date_range, columns=['NAV', 'Nifty50', 'Midcap100'])
-    
-    units, cash, base_nav = 0, 0, 100.0
-    current_holdings = {t: 0 for t in df['Ticker'].unique() if str(t) != 'nan'}
+def fetch_data(tickers, period="10y"):
+    """Fetches historical data with error handling."""
+    data = {}
+    for t in tickers:
+        try:
+            df = yf.download(t, period=period, interval="1d")
+            if not df.empty:
+                data[t] = df['Close']
+        except Exception as e:
+            st.error(f"Error fetching data for {t}: {e}")
+    return pd.DataFrame(data)
 
-    for today in date_range:
-        if today not in all_data.index: continue
-        
-        # Process Transactions
-        day_trans = df[df['Date'].dt.date == today.date()]
-        day_cashflow = 0
-        
-        for _, row in day_trans.iterrows():
-            if row['Type'] == 'DEPOSIT': 
-                day_cashflow += row['Amount']
-                cash += row['Amount']
-            elif row['Type'] == 'BUY':
-                cash -= (row['Quantity'] * row['Price'])
-                current_holdings[row['Ticker']] += row['Quantity']
-            elif row['Type'] == 'SELL':
-                cash += (row['Quantity'] * row['Price'])
-                current_holdings[row['Ticker']] -= row['Quantity']
+# --- SIDEBAR INPUTS ---
+st.sidebar.header("📌 Portfolio Inputs")
+st.sidebar.write("Enter your top 3 Indian stocks:")
 
-        # Value Equity
-        equity_val = sum(current_holdings[t] * all_data.loc[today, f"{t}.NS"] for t in current_holdings if current_holdings[t] > 0)
-        total_value = equity_val + cash
+portfolio_inputs = []
+total_investment = 0
+
+for i in range(1, 4):
+    col1, col2, col3 = st.sidebar.columns([2, 1, 1])
+    with col1:
+        t = st.text_input(f"Ticker {i}", value="RELIANCE" if i==1 else "", key=f"t{i}")
+    with col2:
+        p = st.number_input(f"Avg Price", min_value=0.0, step=1.0, key=f"p{i}")
+    with col3:
+        q = st.number_input(f"Qty", min_value=0, step=1, key=f"q{i}")
+    
+    if t:
+        formatted_t = format_ticker(t)
+        portfolio_inputs.append({'ticker': formatted_t, 'price': p, 'qty': q})
+        total_investment += (p * q)
+
+# --- MAIN LOGIC ---
+st.title("📈 Indian Stock Market Navigator")
+st.markdown("Automated Portfolio NAV tracking vs. Nifty 50 Benchmark.")
+
+if len(portfolio_inputs) > 0:
+    with st.spinner("Analyzing 10 years of market data..."):
+        # Tickers to fetch (Portfolio + Benchmark)
+        tickers_to_get = [stock['ticker'] for stock in portfolio_inputs]
+        benchmark = "^NSEI"
+        all_tickers = tickers_to_get + [benchmark]
         
-        # Unitize
-        if units == 0 and day_cashflow > 0:
-            units = day_cashflow / base_nav
-        elif units > 0 and day_cashflow != 0:
-            prev_nav = history.iloc[history.index.get_loc(today)-1]['NAV']
-            units += (day_cashflow / prev_nav)
+        hist_data = fetch_data(all_tickers)
+        
+        if not hist_data.empty and benchmark in hist_data.columns:
+            # Calculate Portfolio NAV (Historical Value of current holdings)
+            portfolio_nav = pd.Series(0, index=hist_data.index)
+            for stock in portfolio_inputs:
+                if stock['ticker'] in hist_data.columns:
+                    portfolio_nav += hist_data[stock['ticker']] * stock['qty']
             
-        cur_nav = total_value / units if units > 0 else base_nav
-        
-        # Rebase Benchmarks
-        nifty = (all_data.loc[today, "^NSEI"] / all_data.iloc[0]["^NSEI"]) * 100
-        midcap = (all_data.loc[today, "^NSEMDCP100"] / all_data.iloc[0]["^NSEMDCP100"]) * 100
-        
-        history.loc[today] = [cur_nav, nifty, midcap]
-        
-    return history.ffill()
+            # Normalization for comparison (Start at 100)
+            norm_portfolio = (portfolio_nav / portfolio_nav.iloc[0]) * 100
+            norm_nifty = (hist_data[benchmark] / hist_data[benchmark].iloc[0]) * 100
 
-# --- UI DISPLAY ---
-if uploaded_file:
-    data = process_performance(uploaded_file)
-    if data is not None:
-        # Metrics
-        latest = data.iloc[-1]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Current NAV", f"₹{latest['NAV']:.2f}")
-        c2.metric("vs Nifty 50", f"{(latest['NAV']/latest['Nifty50'] - 1)*100:.1f}% Alpha")
-        c3.metric("vs Midcap 100", f"{(latest['NAV']/latest['Midcap100'] - 1)*100:.1f}% Alpha")
-        
-        # Chart
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data.index, y=data['NAV'], name="Portfolio", line=dict(color='#00ffcc', width=3)))
-        fig.add_trace(go.Scatter(x=data.index, y=data['Nifty50'], name="Nifty 50", line=dict(color='white', width=1, dash='dot')))
-        fig.add_trace(go.Scatter(x=data.index, y=data['Midcap_100'], name="Midcap 100", line=dict(color='#ff9900', width=1, dash='dash')))
-        fig.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+            # --- PLOTLY CHART ---
+            fig = go.Figure()
+
+            # Portfolio Line
+            fig.add_trace(go.Scatter(x=norm_portfolio.index, y=norm_portfolio, 
+                                     name="My Portfolio", line=dict(color='#00ff88', width=3)))
+            
+            # Nifty Line
+            fig.add_trace(go.Scatter(x=norm_nifty.index, y=norm_nifty, 
+                                     name="Nifty 50 (Benchmark)", line=dict(color='#ff3366', width=2, dash='dot')))
+
+            # Historical Annotations
+            annotations = [
+                dict(date="2020-03-23", text="COVID Market Crash"),
+                dict(date="2021-10-18", text="Post-Pandemic High"),
+                dict(date="2024-06-04", text="Election Volatility")
+            ]
+
+            for ann in annotations:
+                ann_date = pd.to_datetime(ann['date'])
+                if ann_date in norm_portfolio.index:
+                    fig.add_annotation(x=ann_date, y=norm_portfolio.loc[ann_date],
+                                       text=ann['text'], showarrow=True, arrowhead=1)
+
+            fig.update_layout(
+                title="Relative Growth: Portfolio vs. Nifty 50 (10Y)",
+                xaxis_title="Year",
+                yaxis_title="Normalized Value (Base 100)",
+                hovermode="x unified",
+                template="plotly_dark",
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- AI INSIGHTS SECTION ---
+            st.divider()
+            st.subheader("🤖 AI-Style Insights")
+            
+            curr_val = portfolio_nav.iloc[-1]
+            total_ret_pct = ((curr_val - total_investment) / total_investment * 100) if total_investment > 0 else 0
+            
+            # Determine best stock
+            best_stock = ""
+            max_gain = -999
+            for stock in portfolio_inputs:
+                if stock['ticker'] in hist_data.columns:
+                    s_data = hist_data[stock['ticker']]
+                    gain = ((s_data.iloc[-1] - s_data.iloc[0]) / s_data.iloc[0]) * 100
+                    if gain > max_gain:
+                        max_gain = gain
+                        best_stock = stock['ticker']
+
+            # Trend Analysis (Moving Averages)
+            sma_50 = portfolio_nav.rolling(window=50).mean().iloc[-1]
+            sma_200 = portfolio_nav.rolling(window=200).mean().iloc[-1]
+            trend = "🐂 Bullish" if sma_50 > sma_200 else "🐻 Bearish"
+
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Total Return", f"{total_ret_pct:.2f}%", delta=f"{curr_val - total_investment:,.2f} ₹")
+            col_b.metric("Top Performer", best_stock, f"{max_gain:.1f}% Growth")
+            col_c.metric("Current Trend", trend, "50-day vs 200-day MA")
+
+            with st.expander("View Raw Data"):
+                st.dataframe(hist_data.tail(10))
+        else:
+            st.warning("Could not retrieve enough data. Please check your tickers.")
 else:
-    st.info("👋 Welcome, Fund Manager. Please upload your transaction file or link your Google Sheet in the sidebar to begin.")
+    st.info("👈 Enter your stock tickers and quantities in the sidebar to begin.")
