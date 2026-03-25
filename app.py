@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- CONFIG & CONSTANTS ---
 DB_FILE = "moonshot_portfolio.xlsx"
@@ -14,96 +14,113 @@ st.set_page_config(page_title="Moonshot NAV", layout="wide", page_icon="🚀")
 
 # --- DATA PERSISTENCE LOGIC ---
 def save_data(df, sheet_name):
-    with pd.ExcelWriter(DB_FILE, engine='openpyxl', mode='a' if os.path.exists(DB_FILE) else 'w') as writer:
-        # If sheet exists, overwrite it; otherwise create it
-        if sheet_name in writer.book.sheetnames:
-            idx = writer.book.sheetnames.index(sheet_name)
-            writer.book.remove(writer.book.worksheets[idx])
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    # Ensure directory exists if needed, but here we just manage the file
+    mode = 'a' if os.path.exists(DB_FILE) else 'w'
+    if mode == 'a':
+        with pd.ExcelWriter(DB_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
 
 def load_data(sheet_name):
     if not os.path.exists(DB_FILE):
         return None
     try:
         return pd.read_excel(DB_FILE, sheet_name=sheet_name)
-    except:
+    except Exception:
         return None
 
 def format_ticker(t):
     t = t.strip().upper()
-    return f"{t}.NS" if t and not t.endswith('.NS') and not t.startswith('^') else t
+    if not t: return ""
+    return f"{t}.NS" if not t.endswith('.NS') and not t.startswith('^') else t
+
+def get_price_safely(ticker, start_date):
+    """Fetches price on start_date or the closest subsequent date to avoid IndexError."""
+    try:
+        # Fetch a small window of data starting from the chosen date
+        end_search = start_date + timedelta(days=7)
+        data = yf.download(ticker, start=start_date, end=end_search, progress=False)
+        
+        if not data.empty and 'Close' in data.columns:
+            return float(data['Close'].iloc[0])
+        
+        # Absolute fallback: Get the most recent market price
+        fallback = yf.download(ticker, period="1d", progress=False)
+        return float(fallback['Close'].iloc[-1])
+    except Exception:
+        return 0.0
 
 @st.cache_data(ttl=3600)
 def get_stock_info(tickers):
-    """Fetches Sector and Industry info for the pie chart."""
     info_list = []
     for t in tickers:
         try:
-            stock = yf.Ticker(t)
-            inf = stock.info
+            s = yf.Ticker(t)
             info_list.append({
                 "Ticker": t,
-                "Sector": inf.get("sector", "Unknown"),
-                "Industry": inf.get("industry", "Unknown")
+                "Sector": s.info.get("sector", "Others"),
+                "Industry": s.info.get("industry", "N/A")
             })
         except:
-            info_list.append({"Ticker": t, "Sector": "Unknown", "Industry": "Unknown"})
+            info_list.append({"Ticker": t, "Sector": "Others", "Industry": "N/A"})
     return pd.DataFrame(info_list)
 
 # --- APP INTERFACE ---
 st.title("🚀 Moonshot NAV")
-st.markdown("Professional Portfolio Management & Sector Analytics")
 
-# Check if initial setup exists
 initial_df = load_data("Initial_Setup")
-trans_df = load_data("Transactions")
+meta_df = load_data("Metadata")
 
-# --- INITIAL SETUP UI (First Time Only) ---
-if initial_df is None:
+# --- INITIAL SETUP UI ---
+if initial_df is None or meta_df is None:
     st.header("🏗️ Initial Portfolio Setup")
-    st.info("This is a one-time setup. Provide your starting portfolio weights.")
+    st.info("Set up your 'Day Zero' portfolio. This will be saved to Excel.")
     
     with st.form("setup_form"):
         col1, col2 = st.columns(2)
-        total_val = col1.number_input("Total Portfolio Value (₹)", min_value=1000.0, value=100000.0)
-        cash_val = col2.number_input("Initial Cash Balance (₹)", min_value=0.0, value=10000.0)
-        start_date = st.date_input("Setup Date", value=datetime(2025, 1, 1))
+        total_val = col1.number_input("Total Portfolio Value (₹)", min_value=1.0, value=100000.0)
+        cash_val = col2.number_input("Starting Cash Amount (₹)", min_value=0.0, value=10000.0)
+        start_date = st.date_input("Investment Start Date", value=datetime(2025, 1, 1))
         
-        st.write("Enter Stock Tickers and Weights (must sum to 100% of non-cash value)")
-        t1 = st.text_input("Ticker 1", "RELIANCE")
-        w1 = st.slider("Weight 1 (%)", 0, 100, 40)
-        t2 = st.text_input("Ticker 2", "TCS")
-        w2 = st.slider("Weight 2 (%)", 0, 100, 30)
-        t3 = st.text_input("Ticker 3", "HDFCBANK")
-        w3 = st.slider("Weight 3 (%)", 0, 100, 30)
+        st.write("### Stocks & Weights")
+        c1, c2, c3 = st.columns(3)
+        t1 = c1.text_input("Ticker 1", "RELIANCE")
+        w1 = c1.slider("Weight 1 (%)", 0, 100, 40, key="w1")
         
-        submitted = st.form_submit_button("Initialize Moonshot NAV")
+        t2 = c2.text_input("Ticker 2", "TCS")
+        w2 = c2.slider("Weight 2 (%)", 0, 100, 30, key="w2")
         
-        if submitted:
-            # Calculate initial quantities based on weights
-            equity_val = total_val - cash_val
-            setup_data = []
-            for t, w in [(t1, w1), (t2, w2), (t3, w3)]:
-                ft = format_ticker(t)
-                price = yf.download(ft, start=start_date, end=datetime.now(), progress=False)['Close'].iloc[0]
-                qty = (equity_val * (w/100)) / price
-                setup_data.append({"Ticker": ft, "Qty": float(qty), "Price": float(price)})
-            
-            init_df = pd.DataFrame(setup_data)
-            save_data(init_df, "Initial_Setup")
-            # Save metadata
-            meta = pd.DataFrame([{"Date": start_date, "Initial_Cash": cash_val, "Total_Val": total_val}])
-            save_data(meta, "Metadata")
-            # Create empty transactions sheet
-            save_data(pd.DataFrame(columns=["Date", "Type", "Ticker", "Qty", "Amount"]), "Transactions")
-            st.rerun()
+        t3 = c3.text_input("Ticker 3", "HDFCBANK")
+        w3 = c3.slider("Weight 3 (%)", 0, 100, 30, key="w3")
+        
+        if st.form_submit_button("Launch Moonshot"):
+            if (w1 + w2 + w3) != 100:
+                st.error("Weights must sum to 100%!")
+            else:
+                equity_val = total_val - cash_val
+                setup_rows = []
+                with st.spinner("Fetching historical baseline prices..."):
+                    for t, w in [(t1, w1), (t2, w2), (t3, w3)]:
+                        ft = format_ticker(t)
+                        price = get_price_safely(ft, start_date)
+                        qty = (equity_val * (w/100)) / price if price > 0 else 0
+                        setup_rows.append({"Ticker": ft, "Qty": float(qty), "Base_Price": float(price)})
+                
+                # Save to Excel
+                save_data(pd.DataFrame(setup_rows), "Initial_Setup")
+                save_data(pd.DataFrame([{"Start_Date": start_date, "Init_Cash": cash_val}]), "Metadata")
+                save_data(pd.DataFrame(columns=["Date", "Type", "Ticker", "Qty", "Amount"]), "Transactions")
+                st.rerun()
 
-# --- MAIN DASHBOARD (If Setup Exists) ---
+# --- MAIN DASHBOARD ---
 else:
-    meta = load_data("Metadata")
-    current_cash = meta['Initial_Cash'].iloc[0]
-    
-    # 1. Update Holdings with Transactions
+    start_date = pd.to_datetime(meta_df['Start_Date'].iloc[0])
+    current_cash = float(meta_df['Init_Cash'].iloc[0])
+    trans_df = load_data("Transactions")
+
+    # 1. Calculate Current Holdings
     holdings = initial_df.set_index("Ticker")['Qty'].to_dict()
     if trans_df is not None and not trans_df.empty:
         for _, row in trans_df.iterrows():
@@ -116,74 +133,74 @@ else:
             elif row['Type'] == "Cash Deposit":
                 current_cash += row['Amount']
 
-    # 2. Sidebar: Transactions
-    st.sidebar.header("🛠️ Manage Trades")
-    with st.sidebar.expander("Add New Entry"):
-        t_type = st.selectbox("Type", ["Buy", "Sell", "Cash Deposit"])
-        t_date = st.date_input("Transaction Date")
-        if t_type != "Cash Deposit":
-            t_ticker = format_ticker(st.text_input("Ticker"))
-            t_qty = st.number_input("Quantity", min_value=0.1)
-            t_amt = st.number_input("Total Trade Value (₹)", min_value=1.0)
+    # 2. Sidebar Management
+    st.sidebar.header("📝 Ledger Operations")
+    with st.sidebar.expander("Add Transaction"):
+        ttype = st.selectbox("Action", ["Buy", "Sell", "Cash Deposit"])
+        tdate = st.date_input("Date", value=datetime.now())
+        if ttype != "Cash Deposit":
+            ttick = format_ticker(st.text_input("Ticker"))
+            tqty = st.number_input("Quantity", min_value=0.01)
+            tamt = st.number_input("Total ₹ Value", min_value=1.0)
         else:
-            t_ticker = "CASH"
-            t_qty = 0
-            t_amt = st.number_input("Amount (₹)", min_value=1.0)
-            
-        if st.button("Submit Transaction"):
-            new_row = pd.DataFrame([{"Date": t_date, "Type": t_type, "Ticker": t_ticker, "Qty": t_qty, "Amount": t_amt}])
-            updated_trans = pd.concat([trans_df, new_row])
-            save_data(updated_trans, "Transactions")
+            ttick, tqty = "CASH", 0
+            tamt = st.number_input("Deposit Amount", min_value=1.0)
+        
+        if st.sidebar.button("Execute Trade"):
+            new_t = pd.DataFrame([{"Date": tdate, "Type": ttype, "Ticker": ttick, "Qty": tqty, "Amount": tamt}])
+            save_data(pd.concat([trans_df, new_t]), "Transactions")
             st.rerun()
 
-    # 3. Market Data & NAV
+    # 3. Processing Market Data
     all_tickers = list(holdings.keys()) + [BENCHMARK]
-    with st.spinner("Fetching market prices..."):
-        prices = yf.download(all_tickers, start=meta['Date'].iloc[0], progress=False)['Close']
-        prices = prices.ffill()
+    with st.spinner("Updating Market Data..."):
+        # We fetch from start_date to now
+        data = yf.download(all_tickers, start=start_date, progress=False)['Close']
+        data = data.ffill().dropna(how='all')
 
-    # Calculate NAV Series
-    portfolio_value = pd.Series(0.0, index=prices.index)
-    for ticker, qty in holdings.items():
-        if ticker in prices.columns:
-            portfolio_value += prices[ticker] * qty
+    # Calculate NAV
+    port_val = pd.Series(0.0, index=data.index)
+    for t, q in holdings.items():
+        if t in data.columns:
+            port_val += data[t] * q
     
-    daily_nav = portfolio_value + current_cash
+    daily_nav = port_val + current_cash
     norm_nav = (daily_nav / daily_nav.iloc[0]) * 100
-    norm_nifty = (prices[BENCHMARK] / prices[BENCHMARK].iloc[0]) * 100
+    norm_nifty = (data[BENCHMARK] / data[BENCHMARK].iloc[0]) * 100
 
-    # 4. Charts
-    col_left, col_right = st.columns([2, 1])
+    # 4. Visualization
+    c_main, c_pie = st.columns([2, 1])
     
-    with col_left:
-        fig_nav = go.Figure()
-        fig_nav.add_trace(go.Scatter(x=norm_nav.index, y=norm_nav, name="Moonshot NAV", line=dict(color='#00ff88', width=3)))
-        fig_nav.add_trace(go.Scatter(x=norm_nifty.index, y=norm_nifty, name="Nifty 50", line=dict(color='white', width=1, dash='dot')))
-        fig_nav.update_layout(template="plotly_dark", title="Portfolio Growth vs Nifty 50", hovermode="x unified")
-        st.plotly_chart(fig_nav, use_container_width=True)
+    with c_main:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=norm_nav.index, y=norm_nav, name="Moonshot NAV", line=dict(color='#00ff88', width=3)))
+        fig.add_trace(go.Scatter(x=norm_nifty.index, y=norm_nifty, name="Nifty 50", line=dict(color='#888', width=1, dash='dot')))
+        fig.update_layout(template="plotly_dark", title="Portfolio Performance vs Benchmark", hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
 
-    with col_right:
-        # Sector Breakdown
-        info_df = get_stock_info(list(holdings.keys()))
-        current_prices = prices.iloc[-1]
-        sector_data = []
-        for ticker, qty in holdings.items():
-            val = qty * current_prices[ticker]
-            sec = info_df[info_df['Ticker'] == ticker]['Sector'].values[0]
-            sector_data.append({"Sector": sec, "Value": val})
+    with c_pie:
+        # Sector Allocation
+        info = get_stock_info(list(holdings.keys()))
+        last_prices = data.iloc[-1]
+        sector_map = []
+        for t, q in holdings.items():
+            val = q * last_prices[t] if t in last_prices else 0
+            sec = info[info['Ticker'] == t]['Sector'].values[0] if not info.empty else "Unknown"
+            sector_map.append({"Sector": sec, "Value": val})
         
-        sector_df = pd.DataFrame(sector_data).groupby("Sector").sum().reset_index()
-        fig_pie = px.pie(sector_df, values='Value', names='Sector', title="Sector Allocation", hole=0.4, template="plotly_dark")
-        st.plotly_chart(fig_pie, use_container_width=True)
+        sdf = pd.DataFrame(sector_map).groupby("Sector").sum().reset_index()
+        fig_p = px.pie(sdf, values='Value', names='Sector', hole=0.5, title="Sector Breakdown", template="plotly_dark")
+        st.plotly_chart(fig_p, use_container_width=True)
 
-    # 5. Metrics
+    # 5. Summary Metrics
     st.divider()
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Current NAV", f"₹{daily_nav.iloc[-1]:,.2f}")
-    m2.metric("Total Returns", f"{((daily_nav.iloc[-1] / daily_nav.iloc[0]) - 1)*100:.2f}%")
-    m3.metric("Available Cash", f"₹{current_cash:,.2f}")
-    m4.metric("Holdings Count", len(holdings))
+    cols = st.columns(4)
+    cols[0].metric("Current NAV", f"₹{daily_nav.iloc[-1]:,.0f}")
+    cols[1].metric("Net Profit/Loss", f"{((daily_nav.iloc[-1]/daily_nav.iloc[0])-1)*100:.2f}%")
+    cols[2].metric("Cash Position", f"₹{current_cash:,.0f}")
+    cols[3].metric("Assets", len(holdings))
 
-    if st.sidebar.button("Reset All Data (Danger)"):
-        os.remove(DB_FILE)
-        st.rerun()
+    if st.sidebar.button("🗑️ Factory Reset App"):
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            st.rerun()
